@@ -8,6 +8,9 @@ import {
   normalizeIcpLabels,
   normalizeProfileLabels,
 } from './displayLabels.ts';
+import { completeIcpCandidate } from './icpCompletion.ts';
+import { assertRecipientSafeDraft, buildCopyGrounding } from './copyGrounding.ts';
+import { rankContactCandidates } from './contactSelection.ts';
 
 type ProviderRow = {
   id: string;
@@ -434,6 +437,8 @@ export async function generateAudiencesForWorker(
         ],
         displayLabelRules:
           'Include optional displayLabels with short user-facing labels. Never replace canonical fields. Audience names describe people, not the product; labels must be concise and sentence case.',
+        completionRules:
+          'Complete every ICP field from the canonical product profile and research context. Never return empty strings, nulls, or placeholder values such as Unknown, Unavailable, or Pending human review. When source evidence is insufficient, provide a clearly labeled AI inference and set completion.requiresHumanReview=true. Do not present an inference as source evidence.',
       },
       constraints: {
         doNotApprove: true,
@@ -457,6 +462,9 @@ export async function generateAudiencesForWorker(
     Array.isArray(payload?.audiences) && payload.audiences.length > 0
       ? payload.audiences
       : [buildDeterministicAudience(profile)];
+  const completedAudiences = aiAudiences.map((audience) =>
+    completeIcpCandidate(audience, profile, validatingEvidence),
+  );
   const persisted = [];
   let icpVersion = 1;
   const { data: currentIcp } = await client
@@ -484,7 +492,7 @@ export async function generateAudiencesForWorker(
     .neq('status', 'rejected');
   if (activeIcpError) throw activeIcpError;
   const remainingIcpSlots = Math.max(0, 6 - (activeIcpCount ?? 0));
-  const boundedAudiences = aiAudiences.slice(0, remainingIcpSlots);
+  const boundedAudiences = completedAudiences.slice(0, remainingIcpSlots);
   icpVersion = Number(currentIcp?.version ?? 0) + 1;
   for (const [audienceIndex, audience] of boundedAudiences.entries()) {
     const strategy = deriveAudienceStrategy(audience);
@@ -534,14 +542,26 @@ export async function generateAudiencesForWorker(
         summary: problemFit,
         core_problem: problemFit,
         why_product_fits: fitAssessment,
-        purchase_trigger: String(purchaseTriggers[0] ?? ''),
-        current_alternative: String(buyingBehavior.currentAlternative ?? ''),
-        buying_motivation: problemFit,
-        purchase_friction: String(buyingBehavior.purchaseFriction ?? ''),
-        decision_maker: audience.buyerType === 'organization' ? '' : null,
+        purchase_trigger: String(audience.purchaseTrigger ?? purchaseTriggers[0] ?? problemFit),
+        current_alternative: String(
+          audience.currentAlternative ?? buyingBehavior.currentAlternative ?? 'Existing manual workflows',
+        ),
+        buying_motivation: String(audience.buyingMotivation ?? problemFit),
+        purchase_friction: String(
+          audience.purchaseFriction ?? buyingBehavior.purchaseFriction ?? 'Confirming expected value and changing the current workflow',
+        ),
+        decision_maker:
+          audience.buyerType === 'organization'
+            ? String(audience.decisionMaker ?? buyingBehavior.buyer ?? 'The budget owner or department leader')
+            : null,
         company_characteristics:
-          audience.buyerType === 'organization' ? buyingBehavior : {},
-        user_characteristics: audience.buyerType === 'individual' ? buyingBehavior : {},
+          audience.buyerType === 'organization'
+            ? (audience.companyCharacteristics ?? buyingBehavior)
+            : {},
+        user_characteristics:
+          audience.buyerType === 'individual'
+            ? (audience.userCharacteristics ?? buyingBehavior)
+            : {},
         relevant_language: terminology,
         acquisition_routes: audience.routes ?? [],
         evidence,
@@ -556,9 +576,13 @@ export async function generateAudiencesForWorker(
         is_primary: !hasPrimaryIcp && audienceIndex === 0,
         quality_gate: {
           requiredFieldsPresent: Boolean(
-            problemFit && fitAssessment && purchaseTriggers.length,
+            problemFit && fitAssessment && purchaseTriggers.length &&
+              String(audience.currentAlternative ?? '').trim() &&
+              String(audience.buyingMotivation ?? problemFit).trim() &&
+              String(audience.purchaseFriction ?? '').trim(),
           ),
           requiresHumanReview: true,
+          completion: audience.completion ?? null,
         },
         budget_fit: budgetFit,
         purchase_readiness: purchaseReadiness,
@@ -603,11 +627,10 @@ export async function generateAudiencesForWorker(
           : 'medium',
         status: 'proposed',
         quality_gate: {
-          requiredFieldsPresent: Boolean(
-            problemFit && fitAssessment && evidence.length,
-          ),
+          requiredFieldsPresent: Boolean(problemFit && fitAssessment && purchaseTriggers.length),
           requiresHumanReview: true,
           parentIcpId: icp.id,
+          completion: audience.completion ?? null,
         },
         validation_status: 'pending_review',
         validation_evidence: commercialEvidence,
@@ -849,17 +872,14 @@ export async function suggestAudienceForWorker(
   if (reasoning.status !== 'executed' || !reasoning.result.success) return reasoning;
 
   const raw = reasoning.result.data as Record<string, unknown>;
-  const candidate = Array.isArray(raw)
+  const rawCandidate = Array.isArray(raw)
     ? (raw[0] as Record<string, unknown> | undefined)
     : Array.isArray(raw.audiences)
       ? (raw.audiences[0] as Record<string, unknown> | undefined)
       : raw;
-  if (!candidate || typeof candidate !== 'object')
+  if (!rawCandidate || typeof rawCandidate !== 'object')
     throw new Error('AI returned no suggested audience.');
-  for (const field of ['name','problemUseCaseFit','aiFitAssessment']) {
-    if (typeof candidate[field] !== 'string' || !String(candidate[field]).trim())
-      throw new Error(`Suggested audience has an invalid ${field}. Retry audience research; no audience has been created.`);
-  }
+  const candidate = completeIcpCandidate(rawCandidate, profile, validatingEvidence);
 
   const strategy = deriveAudienceStrategy(candidate);
   const evidence = Array.isArray(candidate.supportingEvidence)
@@ -910,11 +930,13 @@ export async function suggestAudienceForWorker(
       summary: problemFit,
       core_problem: problemFit,
       why_product_fits: fitAssessment,
-      purchase_trigger: String(purchaseTriggers[0] ?? ''),
-      current_alternative: String(buyingBehavior.currentAlternative ?? ''),
-      buying_motivation: problemFit,
-      purchase_friction: String(buyingBehavior.purchaseFriction ?? ''),
-      decision_maker: buyerType === 'organization' ? String(buyingBehavior.buyer ?? '') : null,
+      purchase_trigger: String(candidate.purchaseTrigger ?? purchaseTriggers[0] ?? problemFit),
+      current_alternative: String(candidate.currentAlternative ?? buyingBehavior.currentAlternative ?? 'Existing manual workflows'),
+      buying_motivation: String(candidate.buyingMotivation ?? problemFit),
+      purchase_friction: String(candidate.purchaseFriction ?? buyingBehavior.purchaseFriction ?? 'Confirming expected value and changing the current workflow'),
+      decision_maker: buyerType === 'organization'
+        ? String(candidate.decisionMaker ?? buyingBehavior.buyer ?? 'The budget owner or department leader')
+        : null,
       company_characteristics: buyerType === 'organization' ? buyingBehavior : {},
       user_characteristics: buyerType === 'individual' ? buyingBehavior : {},
       relevant_language: terminology,
@@ -928,14 +950,22 @@ export async function suggestAudienceForWorker(
         : 'medium',
       status: 'proposed',
       is_primary: isPrimary,
-      quality_gate: { requiresHumanReview: true, userSuggested: true },
-      budget_fit: String(buyingBehavior.budgetFit ?? 'Pending human review').trim() || 'Pending human review',
-      purchase_readiness: String(buyingBehavior.purchaseReadiness ?? 'Pending human review').trim() || 'Pending human review',
+      quality_gate: {
+        requiresHumanReview: true,
+        userSuggested: true,
+        completion: candidate.completion ?? null,
+      },
+      budget_fit: String(candidate.budgetFit ?? buyingBehavior.budgetFit ?? 'AI inference requires review').trim(),
+      purchase_readiness: String(candidate.purchaseReadiness ?? buyingBehavior.purchaseReadiness ?? 'AI inference requires review').trim(),
       commercial_evidence: Array.isArray(candidate.commercialEvidence)
         ? candidate.commercialEvidence
-        : [],
+        : [{
+            type: 'ai_inference',
+            statement: 'Commercial fit was inferred from the product profile and requires human confirmation.',
+            confidence: 'low',
+          }],
       validation_status: 'pending_review',
-      validation_rationale: `Suggested by the user: ${input.suggestion.trim()}`,
+      validation_rationale: String(candidate.validationRationale ?? `Suggested by the user: ${input.suggestion.trim()}`),
       created_by: input.actor,
       updated_by: input.actor,
       state_changed_by: input.actor,
@@ -975,7 +1005,12 @@ export async function suggestAudienceForWorker(
         ? candidate.priority
         : 'medium',
       status: 'proposed',
-      quality_gate: { requiresHumanReview: true, userSuggested: true, parentIcpId: icp.id },
+      quality_gate: {
+        requiresHumanReview: true,
+        userSuggested: true,
+        parentIcpId: icp.id,
+        completion: candidate.completion ?? null,
+      },
       validation_status: 'pending_review',
       validation_evidence: Array.isArray(candidate.commercialEvidence)
         ? candidate.commercialEvidence
@@ -1934,9 +1969,21 @@ async function runDirectFindForWorker(
     );
     if (personResult.status !== 'executed' || !personResult.result.success)
       throw new Error(personResult.result?.error?.message ?? 'Person discovery failed. Retry discovery to resume.');
-    for (const person of directCandidates(personResult.result.data).filter(
-      (item) => typeof item.fullName === 'string',
-    )) {
+    const targetRole = [
+      (icp as Record<string, unknown>).decision_maker,
+      (audience.buying_behavior as Record<string, unknown> | null)?.buyer,
+      (audience.buying_behavior as Record<string, unknown> | null)?.decisionMaker,
+    ]
+      .filter((value): value is string => typeof value === 'string')
+      .join(' ');
+    // Select the highest-ranked decision-makers before email lookup and
+    // persistence so one company is never saturated with low-priority contacts.
+    const people = rankContactCandidates(
+      directCandidates(personResult.result.data),
+      targetRole,
+      3,
+    );
+    for (const person of people) {
       discoveryCounts.people += 1;
       await recordProgress('finding_email');
       const personEvidence = directEvidence(person.evidence);
@@ -3499,6 +3546,22 @@ export async function generateEngagementForWorker(
   if (profileError) throw profileError;
   if (!profile)
     throw new Error('Engagement drafting requires an active product profile.');
+  const { data: product, error: productError } = await client
+    .from('sales_os_products')
+    .select('name,description_input,additional_context')
+    .eq('tenant_id', tenantId)
+    .eq('id', job.product_id)
+    .single();
+  if (productError) throw productError;
+  const motion =
+    normalizeMotion(audience.outreach_motion) ??
+    (audience.buyer_type === 'organization' ? 'b2b' : 'b2c');
+  const channel =
+    opportunity.route_type === 'direct'
+      ? 'email'
+      : motion === 'community' || motion === 'b2c'
+        ? 'reddit'
+        : 'professional_social';
   const { data: approvedLearnings, error: learningError } = await client
     .from('sales_os_learnings')
     .select('observation,recommended_change,target_phase')
@@ -3516,12 +3579,13 @@ export async function generateEngagementForWorker(
       contact,
       opportunityEvidence: opportunity,
       channelStrategy: audience.collateral_strategy ?? {},
+      copyGrounding: buildCopyGrounding(product, profile, audience, contact, channel),
       approvedLearnings: approvedLearnings ?? [],
       constraints: {
         requireHumanApproval: true,
         format: 'JSON only',
         draftContentRule:
-          'draftContent must contain exactly one message for the requested channel and copy type. Do not include versions for other channels, section headings, labels such as For Reddit:, or surrounding quotation marks.',
+          'draftContent must contain exactly one message for the requested channel and copy type. Do not include versions for other channels, section headings, labels such as For Reddit:, or surrounding quotation marks. This is first-touch outreach: introduce the product by name, describe capabilities as features of that product, and never imply the recipient already uses or has access to an internal feature. Do not write your [feature], you use [feature], or you have [feature] unless verified recipient evidence explicitly supports it.',
       },
     },
     {
@@ -3539,6 +3603,7 @@ export async function generateEngagementForWorker(
   const draftContent = String(draft.draftContent ?? '').trim();
   if (!messageAngle || !cta || !draftContent)
     throw new Error('AI returned an invalid engagement draft.');
+  assertRecipientSafeDraft(draftContent, String(product.name), profile, channel);
   const evidenceContext = Array.isArray(opportunity.evidence)
     ? opportunity.evidence
     : [];
@@ -3563,15 +3628,6 @@ export async function generateEngagementForWorker(
     draft.previousInteraction && typeof draft.previousInteraction === 'object'
       ? draft.previousInteraction
       : {};
-  const motion =
-    normalizeMotion(audience.outreach_motion) ??
-    (audience.buyer_type === 'organization' ? 'b2b' : 'b2c');
-  const channel =
-    opportunity.route_type === 'direct'
-      ? 'email'
-      : motion === 'community' || motion === 'b2c'
-        ? 'reddit'
-        : 'professional_social';
   const suppressionCheck = { checked: true, result: 'passed', channel };
   const actionType = channel === 'email' ? 'send' : 'respond';
   const { data: existing } = await client
@@ -3726,6 +3782,14 @@ async function generateEngagementFromDecision(
     .maybeSingle();
   if (profileError) throw profileError;
   if (!profile) throw new Error('Copy drafting requires an active product profile.');
+  const { data: product, error: productError } = await client
+    .from('sales_os_products')
+    .select('name,description_input,additional_context')
+    .eq('tenant_id', tenantId)
+    .eq('id', job.product_id)
+    .single();
+  if (productError) throw productError;
+  const channel = decision.channel;
   const { data: approvedLearnings, error: learningError } = await client
     .from('sales_os_learnings')
     .select('observation,recommended_change,target_phase')
@@ -3745,12 +3809,13 @@ async function generateEngagementFromDecision(
       contact: null,
       opportunityEvidence: null,
       channelStrategy: decision.strategy ?? {},
+      copyGrounding: buildCopyGrounding(product, profile, audience, null, channel),
       approvedLearnings: approvedLearnings ?? [],
       constraints: {
         requireHumanApproval: true,
         format: 'JSON only',
         draftContentRule:
-          'draftContent must contain exactly one message for the requested channel and copy type. Do not include versions for other channels, section headings, labels such as For Reddit:, or surrounding quotation marks.',
+          'draftContent must contain exactly one message for the requested channel and copy type. Do not include versions for other channels, section headings, labels such as For Reddit:, or surrounding quotation marks. This is first-touch outreach: introduce the product by name, describe capabilities as features of that product, and never imply the recipient already uses or has access to an internal feature. Do not write your [feature], you use [feature], or you have [feature] unless verified recipient evidence explicitly supports it.',
       },
     },
     {
@@ -3768,6 +3833,7 @@ async function generateEngagementFromDecision(
   const draftContent = String(draft.draftContent ?? '').trim();
   if (!messageAngle || !cta || !draftContent)
     throw new Error('AI returned an invalid engagement draft.');
+  assertRecipientSafeDraft(draftContent, String(product.name), profile, channel);
 
   const { data: existing } = await client
     .from('sales_os_engagements')
@@ -3781,7 +3847,6 @@ async function generateEngagementFromDecision(
     .maybeSingle();
   if (existing) return { ...result, engagementId: existing.id, alreadyExists: true };
 
-  const channel = decision.channel;
   const { data: engagement, error: engagementError } = await client
     .from('sales_os_engagements')
     .insert({
@@ -4895,6 +4960,48 @@ function anthropicStructuredTool(input: Record<string, unknown>) {
                 items: {
                   type: 'object',
                   additionalProperties: true,
+                  required: [
+                    'name',
+                    'buyerType',
+                    'problemUseCaseFit',
+                    'coreProblem',
+                    'whyProductFits',
+                    'purchaseTrigger',
+                    'currentAlternative',
+                    'buyingMotivation',
+                    'purchaseFriction',
+                    'buyingBehavior',
+                    'budgetFit',
+                    'purchaseReadiness',
+                    'commercialEvidence',
+                    'validationRationale',
+                    'purchaseTriggers',
+                    'relevantTerminology',
+                    'supportingEvidence',
+                    'aiFitAssessment',
+                    'routes',
+                  ],
+                  properties: {
+                    name: { type: 'string' },
+                    buyerType: { type: 'string', enum: ['individual', 'organization'] },
+                    problemUseCaseFit: { type: 'string' },
+                    coreProblem: { type: 'string' },
+                    whyProductFits: { type: 'string' },
+                    purchaseTrigger: { type: 'string' },
+                    currentAlternative: { type: 'string' },
+                    buyingMotivation: { type: 'string' },
+                    purchaseFriction: { type: 'string' },
+                    buyingBehavior: { type: 'object' },
+                    budgetFit: { type: 'string' },
+                    purchaseReadiness: { type: 'string' },
+                    commercialEvidence: { type: 'array', items: { type: 'object' } },
+                    validationRationale: { type: 'string' },
+                    purchaseTriggers: { type: 'array', items: { type: 'string' } },
+                    relevantTerminology: { type: 'array', items: { type: 'string' } },
+                    supportingEvidence: { type: 'array', items: { type: 'object' } },
+                    aiFitAssessment: { type: 'string' },
+                    routes: { type: 'array', items: { type: 'object' } },
+                  },
                 },
               },
             },
@@ -4937,11 +5044,11 @@ function anthropicRequestMessage(
 ): string {
   const instruction =
     input.task === 'generate_audience_hypotheses'
-      ? 'Return only a JSON object with a non-empty audiences array. Each audience should include name, buyerType, outreachMotion (b2b, b2c, b2b2c, or community), outreachMotionReason, collateralStrategy, problemUseCaseFit, buyingBehavior, budgetFit, purchaseReadiness, commercialEvidence, validationRationale, commercialIntentScore, purchaseTriggers, relevantTerminology, supportingEvidence, aiFitAssessment, priority, and routes. Also include displayLabels with short user-facing name, problem, and purchaseTriggers labels. Budget fit, purchase readiness, and commercial evidence must be evidence-backed or explicitly marked unknown; do not invent them. Each route must be social or direct. Do not return an empty object or omit routes; the system needs at least one usable route per audience.'
+      ? 'Return only a JSON object with a non-empty audiences array. Return up to 6 materially distinct ICPs: one primary candidate and no more than five secondary candidates. Each audience must include non-empty name, buyerType, outreachMotion (b2b, b2c, b2b2c, or community), outreachMotionReason, collateralStrategy, problemUseCaseFit, coreProblem, whyProductFits, purchaseTrigger, currentAlternative, buyingMotivation, purchaseFriction, buyingBehavior, budgetFit, purchaseReadiness, commercialEvidence, validationRationale, commercialIntentScore, purchaseTriggers, relevantTerminology, supportingEvidence, aiFitAssessment, priority, and routes. For organization audiences, buyingBehavior must separately identify buyer, influencer, and endUser. Also include displayLabels with short user-facing name, problem, and purchaseTriggers labels. Complete missing details using the product profile and research context; label inferred values as AI inference and set completion.requiresHumanReview=true. Never return empty strings, nulls, Unknown, Unavailable, or Pending human review. Do not invent source evidence. Each route must be social or direct, with at least one route per audience.'
       : input.task === 'product_sales_profile'
         ? 'Populate every required product profile field in the tool input. Also populate displayLabels following input.outputRequirements.displayLabelRules when possible. Do not submit an empty object.'
         : input.task === 'generate_engagement_draft'
-          ? 'Populate objective, whyEngage, messageAngle, cta, draftContent, followUpStrategy, and riskSensitivity in the tool input. Include subject for email when applicable. Draft channel-appropriate collateral based on the approved ICP and opportunity evidence. draftContent must contain exactly one message for the requested channel and copy type. Do not include versions for other channels, section headings, labels such as For Reddit:, or surrounding quotation marks. Do not submit an empty object.'
+          ? 'Populate objective, whyEngage, messageAngle, cta, draftContent, followUpStrategy, and riskSensitivity in the tool input. Include subject for email when applicable. Draft channel-appropriate collateral based on the approved ICP and opportunity evidence. draftContent must contain exactly one message for the requested channel and copy type. Do not include versions for other channels, section headings, labels such as For Reddit:, or surrounding quotation marks. This is first-touch outreach: introduce input.copyGrounding.productName, describe capabilities as features of that product, and never imply the recipient already uses or has access to an internal feature. Do not write your [feature], you use [feature], or you have [feature] unless verified recipient evidence explicitly supports it. Do not submit an empty object.'
           : 'Populate the tool input with the complete requested result. Do not submit an empty object.';
   return `${instruction}\nCapability: ${capability}\nInput:\n${JSON.stringify(input)}`;
 }

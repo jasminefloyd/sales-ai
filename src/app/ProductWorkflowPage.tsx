@@ -2273,9 +2273,14 @@ export function ProductWorkflowPage() {
                   Object.entries(audiencesByIcp).flatMap(([icpId, groupedAudiences]) => [
                 <div className="card-heading" key={`audience-group-${icpId}`}>
                   <h3>
-                    {icpId === 'unassigned'
-                      ? 'Audience'
-                      : (icps.find((icp) => icp.id === icpId)?.name ?? 'Audience — parent ICP unavailable')}
+                    {(() => {
+                      if (icpId === 'unassigned') return 'Audience';
+                      const parentName = icps.find((icp) => icp.id === icpId)?.name;
+                      const firstProblem = groupedAudiences[0]?.problem_use_case_fit;
+                      return /(?:\.\.\.|…)$/.test(parentName ?? '') && firstProblem
+                        ? firstProblem
+                        : (parentName ?? 'Audience — parent ICP unavailable');
+                    })()}
                   </h3>
                 </div>,
                 ...groupedAudiences.map((audience) => {

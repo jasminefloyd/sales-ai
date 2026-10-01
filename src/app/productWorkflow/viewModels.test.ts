@@ -57,6 +57,39 @@ describe('product workflow card presenters', () => {
     expect(audience.explain?.fullText?.[0][0]).toBe('Problem');
   });
 
+  it('renders complete audience sentences instead of stored truncated labels', () => {
+    const view = presentAudience({
+      name: 'Teams facing no affordable, automated way to monitor…',
+      problem_use_case_fit: 'No affordable, automated way to monitor local competitors',
+      status: 'approved',
+      purchase_triggers: [
+        'Owner preparing for seasonal demand changes before competitors respond',
+        'New competitor opens nearby and changes local pricing expectations',
+      ],
+      display_labels: {
+        name: 'No affordable, automated way to monitor…',
+        purchaseTriggers: [
+          {
+            source:
+              'Owner preparing for seasonal demand changes before competitors respond',
+            label: 'Owner preparing for seasonal…',
+          },
+        ],
+      },
+    });
+    expect(view.glance.title).toBe(
+      'No affordable, automated way to monitor local competitors',
+    );
+    expect(view.glance.subtitle).toBe(
+      'No affordable, automated way to monitor local competitors',
+    );
+    expect(view.glance.chips?.items).toEqual([
+      'Owner preparing for seasonal demand changes before competitors respond',
+      'New competitor opens nearby and changes local pricing expectations',
+    ]);
+    expect(view.glance.chips?.more).toBe(0);
+  });
+
   it('presents source metadata as audit information', () => {
     const view = presentSource({
       file_name: 'brief.md',

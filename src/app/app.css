@@ -1237,8 +1237,13 @@ select:focus {
   justify-content: space-between;
   gap: 16px;
 }
+.card-heading > div:first-child {
+  min-width: 0;
+}
 .card-heading h3 {
   margin: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 .route-row {
   padding: 12px;

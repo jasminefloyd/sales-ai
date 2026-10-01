@@ -174,6 +174,7 @@ export function isNearDuplicate(a: string, b: string) {
 }
 
 export function labelFor(item: string, labels: ItemLabel[] | undefined) {
+  if (!labels) return item;
   const hit = labels?.find(
     (label) => label.source.trim().toLowerCase() === item.trim().toLowerCase(),
   );

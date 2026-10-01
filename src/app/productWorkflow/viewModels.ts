@@ -171,13 +171,17 @@ export function presentAudience(
   context?: { parentIcpSummary?: string; profileMotion?: string | null },
 ): CardView {
   const problem = String(audience.problem_use_case_fit ?? '');
+  const rawName = String(audience.name ?? '').trim();
+  // Older audience records stored a display-truncated name. The complete
+  // problem/use-case sentence is the authoritative readable fallback for
+  // those records; never render the stored ellipsis as if it were content.
+  const titleSource = /(?:\.\.\.|…)$/.test(rawName) && problem ? problem : rawName;
   const hiddenProblem = Boolean(
     context?.parentIcpSummary && isNearDuplicate(problem, context.parentIcpSummary),
   );
   const triggers = chipsFor(
     strings(audience.purchase_triggers),
-    BUDGET.visibleChips,
-    labels(audience.display_labels, 'purchaseTriggers'),
+    strings(audience.purchase_triggers).length || 1,
   );
   const badges = [badge(audience.status)];
   if (audience.outreach_motion && audience.outreach_motion !== context?.profileMotion)
@@ -185,28 +189,10 @@ export function presentAudience(
   return {
     glance: {
       title:
-        (audience.buying_behavior as { source?: string } | undefined)?.source ===
-        'product_profile_fallback'
-          ? textFor(
-              audience.display_labels?.name,
-              shorten(
-                problem || String(audience.name ?? 'Audience'),
-                BUDGET.titleWords,
-              ),
-              BUDGET.titleWords,
-            )
-          : textFor(
-              audience.display_labels?.name,
-              String(audience.name ?? 'Audience'),
-              BUDGET.titleWords,
-            ),
+        titleSource || problem || 'Audience',
       subtitle: hiddenProblem
         ? undefined
-        : textFor(
-            audience.display_labels?.problem,
-            problem || 'Audience definition pending.',
-            15,
-          ),
+        : problem || 'Audience definition pending.',
       badges,
       chips: { items: triggers.items, more: triggers.more },
       stats: audience.evidence_score

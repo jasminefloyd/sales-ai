@@ -1,7 +1,21 @@
 import {useEffect,useState} from 'react';
 import {supabaseBrowserClient} from '../../lib/supabase/browser';
 
-type Contact={id:string;full_name:string;title:string|null;professional_email:string|null;email_verification_status:string;last_verified_at:string|null;source_evidence:Array<{url?:string;excerpt?:string}>};
+type Evidence={url?:string;excerpt?:string;sourceType?:string};
+type Contact={id:string;full_name:string;title:string|null;professional_email:string|null;email_verification_status:string;last_verified_at:string|null;source_evidence:Evidence[]};
+
+function compactEvidence(value:string) {
+  const clean=value.replace(/\s+/g,' ').trim();
+  const firstChunk=clean.split(/\s+(?:\.{3}|…)+\s+/)[0].trim();
+  const firstSentence=firstChunk.match(/^(.+?[.!?])(?:\s|$)/)?.[1];
+  return firstSentence || firstChunk || clean;
+}
+
+function evidenceSummary(items:Evidence[]) {
+  const unique=[...new Set(items.map(item=>compactEvidence(item.excerpt||'')).filter(Boolean))];
+  return unique.slice(0,2);
+}
+
 export function AudienceContacts({productId,audienceId,refreshKey}:{productId:string;audienceId:string;refreshKey:string}) {
   const [contacts,setContacts]=useState<Contact[]>([]);
   const [error,setError]=useState<string|null>(null);
@@ -38,7 +52,14 @@ export function AudienceContacts({productId,audienceId,refreshKey}:{productId:st
         <p>{contact.professional_email || 'Email not found yet'}</p>
         <span className="status-pill">{contact.professional_email ? `Email ${contact.email_verification_status}` : 'Needs enrichment'}</span>
         {contact.last_verified_at && <p className="muted">Verified {new Date(contact.last_verified_at).toLocaleDateString()}</p>}
-        <details><summary>Contact evidence</summary>{contact.source_evidence?.map((item,index)=><p key={index}>{item.excerpt}{item.url && /^https?:\/\//i.test(item.url) && <> <a href={item.url} target="_blank" rel="noreferrer">Source</a></>}</p>)}</details>
+        <details className="contact-evidence"><summary>Contact evidence <span className="muted">{contact.source_evidence?.length || 0} source records</span></summary>
+          <div className="contact-evidence-summary">
+            <strong>Why this contact</strong>
+            {evidenceSummary(contact.source_evidence || []).map((excerpt,index)=><p key={`${excerpt}-${index}`}>{excerpt}</p>)}
+            {!evidenceSummary(contact.source_evidence || []).length && <p className="muted">No readable evidence excerpt is available.</p>}
+          </div>
+          {contact.source_evidence?.length > 0 && <details className="contact-evidence-full"><summary>View source details</summary>{contact.source_evidence.map((item,index)=><p key={`${item.url||item.excerpt||'source'}-${index}`}>{item.excerpt || 'Source record without an excerpt.'}{item.url && /^https?:\/\//i.test(item.url) && <> <a href={item.url} target="_blank" rel="noreferrer">Source</a></>}</p>)}</details>}
+        </details>
         </div>
       </article>)}
     </div>

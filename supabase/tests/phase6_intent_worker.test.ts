@@ -25,6 +25,13 @@ describe('Sales OS Phase 6 intent worker wiring', () => {
     expect(worker).toContain("event_type: 'intent_scored'");
   });
 
+  it('scopes every persisted intent score to the Sales OS tenant', () => {
+    const insertStart = worker.indexOf(".from('sales_os_intent_scores')");
+    const insertEnd = worker.indexOf(".select('id')", insertStart);
+    const insertBlock = worker.slice(insertStart, insertEnd);
+    expect(insertBlock).toContain('tenant_id: tenantId');
+  });
+
   it('queues intent after quality and dispatches intent jobs', () => {
     expect(dispatcher).toContain('queueFollowUpIntent');
     expect(dispatcher).toContain("job.job_type === 'audience_intent'");
