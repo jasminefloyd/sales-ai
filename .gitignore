@@ -1,0 +1,11 @@
+# Local environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Common local/build output that should not be committed
+node_modules/
+dist/
+coverage/
+supabase/.temp/
+.vercel
